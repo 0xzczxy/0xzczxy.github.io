@@ -90,7 +90,62 @@ Once detected, I locate two critical exported functions using PE parsing:
 - `BlImgAllocateImageBuffer` - allocates memory for loaded images
 - `BlLdrLoadImage` - loads PE images during boot
 
-### Challenge 2: Position-Independent Payload
+### Challenge 2: Patching the VM Exit Handler
+
+The hypervisor's VM exit handler is called every time the VM needs to exit to handle privileged operations. I needed to:
+
+1. **Find the call instruction** - pattern scanning within the hypervisor image
+2. **Calculate relative offset** - maintain proper control flow
+3. **Redirect the call** - patch to jump to our code
+4. **Chain to original** - ensure normal operation continues
+
+For Intel (hvix64.exe):
+```c
+// Pattern: E8 ? ? ? ? E9 ? ? ? ? 74
+//          ^^ relative call
+```
+
+For AMD (hvax64.exe):
+```c
+// Pattern: E8 ? ? ? ? 48 89 04 24 E9
+//          ^^ relative call
+```
+
+![Disassembly View](../assets/extendedhv-patch.png)
+*[Screenshot: IDA/Ghidra showing patched call instruction]*
+
+The patch process:
+1. Read current 32-bit relative offset
+2. Calculate absolute address of original handler
+3. Write new offset pointing to our payload
+4. Store offset back to original in our payload's global variable
+
+### Challenge 3: Memory Allocation Extension
+
+The hypervisor is loaded with a specific memory allocation. To fit our payload, I patched `BlImgAllocateImageBuffer` to detect hypervisor allocations and extend them:
+
+```c
+if (attributes == ATTRIBUTE_HV_IMAGE && !gExtendedAllocation) {
+    imageSize += PAYLOAD_SIZE;
+    memoryType = MEMORY_ATTRIBUTE_RWX;  // Read-Write-Execute
+    gExtendedAllocation = TRUE;
+}
+```
+
+### Challenge 5: Adding a PE Section
+
+The hypervisor PE needs a new section to hold our code. I implemented PE manipulation to:
+- Calculate proper virtual addresses with alignment
+- Update section count in PE headers
+- Update `SizeOfImage` in optional header
+- Set appropriate section characteristics (RWX)
+
+![PE Section View](../assets/extendedhv-section.png)
+*[Screenshot: PE viewer showing new .zczxyhc section]*
+
+---
+
+### Challenge 6: Position-Independent Payload
 
 The hypervisor runs in a completely different address space than UEFI. Our injected code must be:
 - **Position-independent** - no absolute addresses
@@ -123,85 +178,48 @@ SECTIONS {
 
 This guarantees our global offset variable is at position 0x0 and our handler function starts at 0x10.
 
-### Challenge 3: Patching the VM Exit Handler
-
-The hypervisor's VM exit handler is called every time the VM needs to exit to handle privileged operations. I needed to:
-
-1. **Find the call instruction** - pattern scanning within the hypervisor image
-2. **Calculate relative offset** - maintain proper control flow
-3. **Redirect the call** - patch to jump to our code
-4. **Chain to original** - ensure normal operation continues
-
-For Intel (hvix64.exe):
-```c
-// Pattern: FB 8B D6 0B 54 24 30 E8 ? ? ? ?
-//                              ^^ relative call
-```
-
-For AMD (hvax64.exe):
-```c
-// Pattern: E8 ? ? ? ? 48 89 04 24 E9
-//          ^^ relative call
-```
-
-![Disassembly View](../assets/extendedhv-patch.png)
-*[Screenshot: IDA/Ghidra showing patched call instruction]*
-
-The patch process:
-1. Read current 32-bit relative offset
-2. Calculate absolute address of original handler
-3. Write new offset pointing to our payload
-4. Store offset back to original in our payload's global variable
-
-### Challenge 4: Memory Allocation Extension
-
-The hypervisor is loaded with a specific memory allocation. To fit our payload, I patched `BlImgAllocateImageBuffer` to detect hypervisor allocations and extend them:
-
-```c
-if (attributes == ATTRIBUTE_HV_IMAGE && !gExtendedAllocation) {
-    imageSize += PAYLOAD_SIZE;
-    memoryType = MEMORY_ATTRIBUTE_RWX;  // Read-Write-Execute
-    gExtendedAllocation = TRUE;
-}
-```
-
-### Challenge 5: Adding a PE Section
-
-The hypervisor PE needs a new section to hold our code. I implemented PE manipulation to:
-- Calculate proper virtual addresses with alignment
-- Update section count in PE headers
-- Update `SizeOfImage` in optional header
-- Set appropriate section characteristics (RWX)
-
-![PE Section View](../assets/extendedhv-section.png)
-*[Screenshot: PE viewer showing new .zczxyhc section]*
-
----
-
 ## The Payload: Intercepting CPUID
 
-The injected payload demonstrates hypervisor-level code execution by intercepting CPUID instructions (exit reason 0x0A on Intel):
+The injected payload demonstrates hypervisor-level code execution by intercepting CPUID instructions the code is architecture specific but an example handler looks like this:
 
 ```c
-uint64_t hooked_vmexit_handler(void *arg1, 
-                               uint32_t exit_reason, 
-                               uint32_t exit_reason_full) {
-    
-    if (exit_reason == 0x0A) {  // CPUID exit
-        uint64_t *guest_regs = *(uint64_t**)arg1;
-        uint64_t leaf = guest_regs[0];  // RAX contains CPUID leaf
-        
-        if (leaf == 0xDEADBEEFDEADBEEF) {
-            // Return custom signature
-            guest_regs[0] = 0x00636879787a637a;  // "zczxyhc\0"
-        }
+uint64_t __attribute__((ms_abi)) vmexit_handler(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+  if (!g_has_been_called) {
+    g_has_been_called = 1;
+    serial_write("[+] Intel VM-Exit Handler Initialized.\n");
+  }
+
+  //
+  // Read through vmread(VMCS_EXIT_REASON)
+  // 
+  uint64_t exit_reason = vmread(VMCS_EXIT_REASON);
+
+  //
+  // Check if we this was caused by a cpuid
+  // 
+  if (exit_reason == VMX_EXIT_REASON_EXECUTE_CPUID) {
+    context_t *ctx = *(context_t**)a1;
+
+    //
+    // Check if rax is set to our special value
+    // 
+    if (ctx->rax == 0xDEADBEEFDEADBEEFull) {
+      serial_write("[*] CPUID Called with 0xDEADBEEFDEADBEEF!\n");
+
+      //
+      // custom return value: zczxyhc\0 in little endian
+      // 
+      ctx->r8 = 0x00636879787A637Aull;
     }
-    
-    // Chain to original handler
-    original_vmexit_handler_t original = (original_vmexit_handler_t)(
-        (uint64_t)hooked_vmexit_handler + G_original_offset_from_hook
-    );
-    return original(arg1, exit_reason, exit_reason_full);
+  }
+
+  //
+  // Forward
+  //
+  original_vmexit_handler_t original = (original_vmexit_handler_t)(
+    (uint64_t)vmexit_handler + G_original_offset_from_hook
+  );
+  return original(a1, a2, a3, a4);
 }
 ```
 
@@ -265,21 +283,9 @@ The two hypervisor implementations have completely different calling conventions
 
 Windows updates change the hypervisor internals. The Intel pattern needed adjustment for recent builds. A more robust pattern matching system would improve reliability.
 
-### Cache Coherency
+### Low Level Dumb Stuff
 
-Critical lesson learned: **always flush instruction cache** after code patching. The CPU's instruction cache can hold stale code, causing crashes or unexpected behavior:
-
-```c
-static inline VOID FlushInstructionCache(VOID *address, UINTN size) {
-    // Flush cache lines
-    for (UINT64 addr = (UINT64)address; addr < end; addr += 64) {
-        __asm__ volatile("clflush (%0)" :: "r"(addr) : "memory");
-    }
-    
-    // Memory fence and serialization
-    __asm__ volatile("mfence\n\t" "cpuid" ::: "rax","rbx","rcx","rdx","memory");
-}
-```
+The major set backs were not anything specific but just a simple mistake which propagated itself heavily, working on being a better programmer or sticking to a more robust style would probably help in a lot of these cases.
 
 ---
 
@@ -291,7 +297,7 @@ The driver successfully:
 - ✅ Injects position-independent code into the hypervisor
 - ✅ Intercepts VM exit events with custom handler
 - ✅ Provides working hypercall interface via CPUID
-- ✅ Supports both Intel VT-x and AMD-V architectures
+- ✅ Supports both Intel VT-x
 
 ---
 
@@ -339,11 +345,9 @@ The repository includes:
 ## References & Inspiration
 
 This project builds on research from:
-- **Voyager** by back engineering - AMD hypervisor hooking
-- **Intel VT-x Specification** - Understanding VM exits
-- **AMD-V Specification** - SVM architecture
-- **UEFI Specification 2.10** - Boot services and protocols
-- **Windows Internals** - Boot process and Hyper-V architecture
+- [noahware/hyper-reV](https://github.com/noahware/hyper-reV/tree/main)
+- [backengineering/Voyager](https://github.com/backengineering/Voyager/tree/master)
+- [SamuelTulach/SecureHack](https://github.com/SamuelTulach/SecureHack)
 
 ---
 
