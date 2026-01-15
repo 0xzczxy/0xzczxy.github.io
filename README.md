@@ -1,6 +1,6 @@
 # Daniel (0xzczxy)
 
-**17 | UK | Aspiring Security Researcher**
+**17** | **UK** | **Aspiring Security Researcher**
 
 Welcome to my corner of the internet. I'm Daniel, a student passionate about low-level systems programming, ethical hacking, and cybersecurity research. Currently applying to universities in the UK to pursue computer science and security.
 
